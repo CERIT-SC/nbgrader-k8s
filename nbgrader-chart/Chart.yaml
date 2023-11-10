@@ -1,0 +1,11 @@
+apiVersion: v2
+name: nbgrader
+description: A Helm chart for deploying nbgrader
+type: application
+version: 0.1.0
+appVersion: '0.9.1'
+
+dependencies:
+  - name: jupyterhub
+    version: 3.0.3
+    repository: https://hub.jupyter.org/helm-chart/

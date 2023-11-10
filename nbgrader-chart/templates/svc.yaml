@@ -1,0 +1,9 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "nbgrader.fullname" . }}
+spec:
+  clusterIP: None
+  selector:
+    app: jupyterhub
+    component: hub

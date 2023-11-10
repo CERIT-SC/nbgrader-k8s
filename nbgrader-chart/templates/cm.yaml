@@ -1,0 +1,34 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nbgrader-config-global
+data:
+  nbgrader_config.py: |
+    import os
+    from nbgrader.server_extensions.assignment_list.handlers import AssignmentList
+    from nbgrader.auth import Authenticator, JupyterHubAuthPlugin
+
+    c = get_config()
+    c.Exchange.path_includes_course = True
+    c.Exchange.root = "/mnt/exchange"
+    c.Authenticator.plugin_class = JupyterHubAuthPlugin
+
+    c.ExchangeFactory.collect = 'nbgrader_k8s_exchange.plugin.ExchangeCollect'
+    c.ExchangeFactory.exchange = 'nbgrader_k8s_exchange.plugin.Exchange'
+    c.ExchangeFactory.fetch_assignment = 'nbgrader_k8s_exchange.plugin.ExchangeFetchAssignment'
+    c.ExchangeFactory.fetch_feedback = 'nbgrader_k8s_exchange.plugin.ExchangeFetchFeedback'
+    c.ExchangeFactory.list = 'nbgrader_k8s_exchange.plugin.ExchangeList'
+    c.ExchangeFactory.release_assignment = 'nbgrader_k8s_exchange.plugin.ExchangeReleaseAssignment'
+    c.ExchangeFactory.release_feedback = 'nbgrader_k8s_exchange.plugin.ExchangeReleaseFeedback'
+    c.ExchangeFactory.submit = 'nbgrader_k8s_exchange.plugin.ExchangeSubmit'
+
+    # List courses for the student even if there are no assignments
+    def list_courses(self):
+        auth = Authenticator(config=c)
+
+        return {
+          "success": True,
+          "value":  auth.get_student_courses(os.environ['JUPYTERHUB_USER'])
+        }
+
+    AssignmentList.list_courses = list_courses

@@ -1,0 +1,519 @@
+exchange:
+  # Select the size of the exchange volume
+  size: 10Gi
+  # Select the storage class
+  storageClassName: nfs-csi
+
+# https://github.com/jupyterhub/zero-to-jupyterhub-k8s/blob/main/jupyterhub/values.yaml
+jupyterhub:
+  debug:
+    enabled: true
+
+  proxy:
+    service:
+      type: ClusterIP
+    chp:
+      resources:
+        requests:
+          cpu: 500m
+          memory: 512Mi
+        limits:
+          cpu: 1000m
+          memory: 512Mi
+      containerSecurityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop:
+            - ALL
+      extraPodSpec:
+        securityContext:
+          runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
+
+      networkPolicy:
+        enabled: false
+
+  rbac:
+    create: true
+
+  ingress:
+    ## Example ingress configuration
+    # enabled: true
+    # hosts:
+    #   - nbgrader.example.com
+    # tls:
+    #   - hosts:
+    #       - nbgrader.example.com
+    #     secretName: nbgrader-example-com-tls
+
+    enabled: false
+    annotations: {}
+    hosts: []
+    tls: []
+
+  hub:
+    extraConfig:
+      01-extra-config: |
+        import os, nativeauthenticator
+
+        c.MappingKernelManager.cull_connected = False
+        c.MappingKernelManager.cull_busy = False
+        c.MappingKernelManager.cull_idle_timeout = 259200
+        c.NotebookApp.shutdown_no_activity_timeout = 259200
+
+        c.KubeSpawner.auth_state_hook = userdata_hook
+        c.KubeSpawner.pre_spawn_hook = bootstrap_pre_spawn
+        c.KubeSpawner.automount_service_account_token = False
+
+        c.JupyterHub.template_paths = ['/etc/jupyterhub/templates/', f"{os.path.dirname(nativeauthenticator.__file__)}/templates/"]
+
+      02-extra-config: |
+        from jupyterhub.handlers import BaseHandler
+        from nativeauthenticator.handlers import SignUpHandler
+        from nativeauthenticator import NativeAuthenticator
+
+        # In the /hub/home "Services" dropdown, show only courses that the user is enrolled in
+        def get_accessible_services(self, user):
+          accessible_services = []
+          if user is None:
+            return accessible_services
+
+          courses = []
+          for group in user.groups:
+            if group.name.startswith("formgrade-"):
+              courses.append(group.name.replace("formgrade-", ""))
+
+          for service in self.services.values():
+            if not service.name in courses:
+              continue
+            if not service.url:
+              continue
+            if not service.display:
+              continue
+            accessible_services.append(service)
+
+          return accessible_services
+
+        # Allow only alphanumeric usernames
+        def make_validate_username(cls):
+          __class__ = cls
+          def validate_username(self, username):
+            if not username.isalnum():
+                return False
+            if not username[0].isalpha():
+                return False
+            return super().validate_username(username)
+          return validate_username
+
+        # Update sign up error messages
+        def get_result_message(
+          self,
+          user,
+          assume_user_is_human,
+          username_already_taken,
+          confirmation_matches,
+          user_is_admin,
+        ):
+          if not assume_user_is_human:
+            alert = "alert-danger"
+            message = "You failed the reCAPTCHA. Please try again"
+          elif username_already_taken:
+            alert = "alert-danger"
+            message = (
+              "Something went wrong!\nIt appears that this "
+              "username is already in use. Please try again "
+              "with a different username."
+            )
+          elif not confirmation_matches:
+            alert = "alert-danger"
+            message = "Your password did not match the confirmation. Please try again."
+          elif not user:
+            alert = "alert-danger"
+            minimum_password_length = self.authenticator.minimum_password_length
+            if minimum_password_length > 0:
+              message = (
+                "Something went wrong!\nBe sure your username "
+                "does only contain alphanumeric characters, your "
+                f"password has at least {minimum_password_length} "
+                "characters and is not too common."
+              )
+            else:
+              message = (
+                "Something went wrong!\nBe sure your username "
+                "does only contain alphanumeric characters and your "
+                "password is not too common."
+              )
+          # If user creation went through & open-signup is enabled, success.
+          # If user creation went through & the user is an admin, also success.
+          elif (user is not None) and (self.authenticator.open_signup or user_is_admin):
+            alert = "alert-success"
+            message = (
+              "The signup was successful! You can now go to "
+              "the home page and log in to the system."
+            )
+          else:
+            # Default response if nothing goes wrong.
+            alert = "alert-info"
+            message = "Your information has been sent to the admin."
+
+            if (user is not None) and user.login_email_sent:
+              message = (
+                "The signup was successful! Check your email "
+                "to authorize your access."
+              )
+
+          return alert, message
+
+        BaseHandler.get_accessible_services = get_accessible_services
+        NativeAuthenticator.validate_username = make_validate_username(NativeAuthenticator)
+        SignUpHandler.get_result_message = get_result_message
+
+      00-extra-config: |
+        from traitlets import default, Unicode
+        from tornado import gen
+        from kubespawner import KubeSpawner
+        import asyncio
+        import kubernetes_asyncio
+        from kubernetes_asyncio import config, client
+        from kubernetes_asyncio.client import (
+            V1ObjectMeta,
+            V1Secret,
+            V1PersistentVolume,
+            V1PersistentVolumeClaim,
+            V1ResourceRequirements,
+            V1LabelSelector,
+            V1CSIPersistentVolumeSource,
+            V1PersistentVolumeSpec,
+            V1PersistentVolumeClaimSpec,
+            ApiException,
+        )
+
+        # Define all the courses and their instructors
+        COURSES={"course1":["instructor1", "instructor2"], "course2":["instructor1"], "course3": ["instructor2"]}
+
+        def userdata_hook(spawner, auth_state):
+          spawner.userdata = auth_state
+
+        async def check_pvc(home_pvc_name, namespace):
+            async with kubernetes_asyncio.client.ApiClient() as api_client:
+                v1 = kubernetes_asyncio.client.CoreV1Api(api_client)
+                pvcs = await v1.list_namespaced_persistent_volume_claim(namespace)
+                for claim in pvcs.items:
+                    if claim.metadata.name == home_pvc_name:
+                        return claim
+                return None
+
+        async def delete_pvc(namespace, pvc):
+            async with kubernetes_asyncio.client.ApiClient() as api_client:
+                v1 = kubernetes_asyncio.client.CoreV1Api(api_client)
+                await v1.delete_namespaced_persistent_volume_claim(name=pvc, namespace=namespace)
+                await asyncio.sleep(1)
+
+        async def create_pvc(home_pvc_name, home_pv_name, namespace, storage_class, capacity):
+            pvc = V1PersistentVolumeClaim()
+            pvc.api_version = "v1"
+            pvc.kind = "PersistentVolumeClaim"
+            pvc.metadata = V1ObjectMeta()
+            pvc.metadata.name = home_pvc_name
+            pvc.spec = V1PersistentVolumeClaimSpec()
+            pvc.spec.access_modes = ['ReadWriteMany']
+            pvc.spec.resources = V1ResourceRequirements()
+            pvc.spec.resources.requests = {"storage": capacity}
+            pvc.spec.storage_class_name = storage_class
+            if storage_class != "nfs-csi":
+                pvc.spec.selector = V1LabelSelector()
+                pvc.spec.selector.match_labels = {"name": home_pv_name}
+            try:
+              async with kubernetes_asyncio.client.ApiClient() as api_client:
+                v1 = kubernetes_asyncio.client.CoreV1Api(api_client)
+                x = await v1.create_namespaced_persistent_volume_claim(namespace, pvc)
+                await asyncio.sleep(1)
+            except ApiException as e:
+              if re.search("object is being deleted:", e.body):
+                raise web.HTTPError(401, "Can't delete PVC {}, please contact administrator!".format(home_pvc_name))
+                return False
+            return True
+
+        def add_volume(spawner_vol_list, volume, volname):
+          if len(spawner_vol_list) == 0:
+            spawner_vol_list = [volume]
+          else:
+            volume_exists = False
+            for vol in spawner_vol_list:
+                if "name" in vol and vol["name"] == volname:
+                    volume_exists = True
+            if not volume_exists:
+                spawner_vol_list.append(volume)
+
+        def mount(spawner, pv, pvc, mountpath, type):
+            volume = {}
+            volume_mount = {}
+            if type == "pvc":
+              volume = {"name": pv, "persistentVolumeClaim": {"claimName": pvc}}
+              volume_mount = {"mountPath": mountpath, "name": pv}
+            elif type == "cm":
+              volume = {"name": pv, "configMap": {"name": pvc}}
+              volume_mount = {"mountPath": mountpath, "name": pv}
+            add_volume(spawner.volumes, volume, pv)
+            add_volume(spawner.volume_mounts, volume_mount, pvc)
+
+        async def mount_persistent_hub_home(spawner, username, namespace):
+            hub_home_name = username + "-home-default"
+
+            pvc = await check_pvc(hub_home_name, namespace)
+            if not pvc:
+              await create_pvc(hub_home_name, hub_home_name + "-pv", namespace, "nfs-csi", "10Gi")
+
+            mount(spawner, hub_home_name + "-pv", hub_home_name, "/home/jovyan", "pvc")
+
+        def set_resources(spawner):
+          spawner.cpu_limit = 2 
+          spawner.cpu_guarantee = 2
+          spawner.mem_limit = '4G'
+          spawner.mem_guarantee = '4G'
+          spawner.container_security_context = {"capabilities": {"drop": ["ALL"]}}
+
+
+        async def bootstrap_pre_spawn(spawner):
+          config.load_incluster_config()
+          groups = []
+          for n in spawner.user.groups:
+            groups.append(n.name)
+          namespace = spawner.namespace
+          username = spawner.user.name
+
+          spawner.start_timeout = 600
+
+          await mount_persistent_hub_home(spawner, username, namespace)
+
+          isStudent = True
+          volume = {"name": "nbgrader-exchange", "persistentVolumeClaim": {"claimName": "nbgrader-exchange"}}
+          add_volume(spawner.volumes, volume, volume["name"])
+
+          for group in groups:
+            if group.startswith("formgrade-"):
+              isStudent = False
+              courseName = group.replace("formgrade-", "")
+
+              volume_mount = {"mountPath": f"/mnt/exchange", "name": "nbgrader-exchange"}
+              add_volume(spawner.volume_mounts, volume_mount, volume_mount["name"])
+            elif group.startswith("nbgrader-"):
+              courseName = group.replace("nbgrader-", "")
+
+              if not os.path.exists(f'/mnt/exchange/{courseName}/inbound/{username}'):
+                os.makedirs(f"/mnt/exchange/{courseName}/inbound/{username}")
+              if not os.path.exists(f'/mnt/exchange/{courseName}/feedback_public/{username}'):
+                os.makedirs(f"/mnt/exchange/{courseName}/feedback_public/{username}")
+
+              spawner.volume_mounts.extend([{
+                  "name": "nbgrader-exchange", 
+                  "mountPath": f"/mnt/exchange/{courseName}/inbound/{username}",
+                  "subPath": f"{courseName}/inbound/{username}",
+                },
+                {
+                  "name": "nbgrader-exchange", 
+                  "mountPath": f"/mnt/exchange/{courseName}/feedback_public/{username}",
+                  "subPath": f"{courseName}/feedback_public/{username}",
+                },
+                {
+                  "name": "nbgrader-exchange",
+                  "mountPath": f"/mnt/exchange/{courseName}/outbound",
+                  "subPath": f"{courseName}/outbound",
+                  "readOnly": True
+                }
+              ])
+            
+          if isStudent:
+            spawner.image = "cerit.io/hubs/nbgrader-student:10-11-2023"
+          else:
+            spawner.image = "cerit.io/hubs/nbgrader-instructor:10-11-2023"
+
+          set_resources(spawner)
+
+          if "--SingleUserNotebookApp.max_body_size=6291456000" not in spawner.args:
+                  spawner.args.append("--SingleUserNotebookApp.max_body_size=6291456000")
+
+
+        groupsToCreate = {}
+
+        base_port = 9000
+        idx = 0
+        for course, instructors in COURSES.items():
+          # "outbound" must exist before starting a singleuser 
+          if not os.path.exists(f'/mnt/exchange/{course}/outbound'):
+            os.makedirs(f"/mnt/exchange/{course}/outbound")
+          if not os.path.exists(f'/mnt/exchange/{course}/inbound'):
+            os.makedirs(f"/mnt/exchange/{course}/inbound")
+          if not os.path.exists(f'/mnt/exchange/{course}/feedback_public'):
+            os.makedirs(f"/mnt/exchange/{course}/feedback_public")
+          
+          with open(f"/mnt/exchange/{course}/nbgrader_config.py", "w") as f:
+            f.write("c = get_config()\n")
+            f.write(f"c.CourseDirectory.root = '/mnt/exchange/{course}'\n")
+            f.write(f"c.CourseDirectory.course_id = '{course}'\n")
+
+          c.JupyterHub.services.append(
+            {
+              "name": course,
+              "url": f"http://course-svc:{base_port + idx}",
+              "command": ["jupyterhub-singleuser", f"--group=formgrade-{course}", f"--port={base_port + idx}", "--debug", "--ServerApp.ip=0.0.0.0"],
+              "cwd": f"/mnt/exchange/{course}",
+              "oauth_no_confirm": True,
+              "environment" : {
+                # Here nbgrader.auth.JupyterHubAuthPlugin needs a user, that always exists
+                "JUPYTERHUB_USER": "admin"
+              }
+            }
+          )
+
+          groupsToCreate[f"nbgrader-{course}"] = []
+          groupsToCreate[f"formgrade-{course}"] = instructors
+
+          c.JupyterHub.load_roles.append({
+            "name": f"formgrade-{course}",
+            "groups": [f"formgrade-{course}"],
+            "services": [course],
+            "scopes": [
+              f"access:services!service={course}", 
+              f"read:services!service={course}", 
+              f"list:services!service={course}", 
+              "groups", 
+              "users"
+            ]
+          })
+          idx += 1
+
+        c.JupyterHub.load_groups = groupsToCreate
+
+    config:
+      Authenticator:
+        # If any more admins, existing ones must set as admin in UI
+        # Changes will disappear if db disappears
+        admin_users:
+          - 'admin'
+        enable_auth_state: true
+        auto_login: False
+      NativeAuthenticator:
+        check_common_password: true
+        minimum_password_length: 8
+        ask_email_on_signup: true
+      JupyterHub:
+        authenticator_class: 'native'
+        # Allow servers do anything their owners can do
+        load_roles:
+          - name: 'server'
+            scopes:
+              - 'inherit'
+    image:
+      name: cerit.io/hubs/nbgrader-hub
+      tag: '10-11-2023'
+      pullPolicy: Always
+    resources:
+      requests:
+        memory: '4Gi'
+        cpu: '2000m'
+      limits:
+        memory: '4Gi'
+        cpu: '2000m'
+    livenessProbe:
+      initialDelaySeconds: 10
+      periodSeconds: 10
+      failureThreshold: 10
+      timeoutSeconds: 10
+    readinessProbe:
+      initialDelaySeconds: 10
+      periodSeconds: 10
+      failureThreshold: 10
+      timeoutSeconds: 10
+    db:
+      # Select the storage class for the hub database
+      pvc:
+        storageClassName: 'nfs-csi'
+    containerSecurityContext:
+      allowPrivilegeEscalation: false
+      runAsUser: 1000
+      runAsGroup: 1000
+      capabilities:
+        drop:
+          - ALL
+    podSecurityContext:
+      fsGroup: 2000
+      fsGroupChangePolicy: OnRootMismatch
+      runAsNonRoot: true
+      seccompProfile:
+        type: RuntimeDefault
+    consecutiveFailureLimit: 0
+    networkPolicy:
+      enabled: false
+      interNamespaceAccessLabels: 'accept'
+      egressAllowRules:
+        cloudMetadataServer: false
+    # Exchange dir mounted to hub pod to ensure student path creation
+    extraVolumes:
+      - name: nbgrader-exchange
+        persistentVolumeClaim:
+          claimName: nbgrader-exchange
+      - name: nbgrader-config-global
+        configMap:
+          name: nbgrader-config-global
+    extraVolumeMounts:
+      - name: nbgrader-exchange
+        mountPath: '/mnt/exchange'
+      - name: nbgrader-config-global
+        mountPath: '/etc/jupyter/'
+        readOnly: true
+
+  singleuser:
+    networkPolicy:
+      enabled: false
+    cloudMetadata:
+      blockWithIptables: false
+    defaultUrl: '/lab'
+    storage:
+      type: none
+      extraVolumes:
+        - name: nbgrader-config-global
+          configMap:
+            name: nbgrader-config-global
+      extraVolumeMounts:
+        - name: nbgrader-config-global
+          mountPath: '/etc/jupyter/'
+          readOnly: true
+    cmd: jupyterhub-singleuser
+    uid: 1000
+    fsGid: 100
+    startTimeout: 300
+    allowPrivilegeEscalation: false
+    extraPodConfig:
+      securityContext:
+        fsGroup: 100
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+    lifecycleHooks:
+      postStart:
+        exec:
+          command:
+            - 'bash'
+            - '-c'
+            - >
+              echo -e "envs_dirs:\n  - /home/jovyan/my-conda-envs/" > /home/jovyan/.condarc;
+
+  scheduling:
+    userScheduler:
+      enabled: false
+    userPlaceholder:
+      enabled: false
+
+  prePuller:
+    hook:
+      enabled: false
+    continuous:
+      enabled: false
+
+  cull:
+    enabled: false
+    users: true
+    timeout: 259200
+    every: 3600
