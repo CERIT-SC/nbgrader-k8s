@@ -191,6 +191,7 @@ jupyterhub:
 
         # Define all the courses and their instructors
         COURSES={"course1":["instructor1", "instructor2"], "course2":["instructor1"], "course3": ["instructor2"]}
+        PVC_STORAGE_CLASS = "nfs-csi"
 
         def userdata_hook(spawner, auth_state):
           spawner.userdata = auth_state
@@ -221,7 +222,7 @@ jupyterhub:
             pvc.spec.resources = V1ResourceRequirements()
             pvc.spec.resources.requests = {"storage": capacity}
             pvc.spec.storage_class_name = storage_class
-            if storage_class != "nfs-csi":
+            if storage_class != PVC_STORAGE_CLASS:
                 pvc.spec.selector = V1LabelSelector()
                 pvc.spec.selector.match_labels = {"name": home_pv_name}
             try:
@@ -263,7 +264,7 @@ jupyterhub:
 
             pvc = await check_pvc(hub_home_name, namespace)
             if not pvc:
-              await create_pvc(hub_home_name, hub_home_name + "-pv", namespace, "nfs-csi", "10Gi")
+              await create_pvc(hub_home_name, hub_home_name + "-pv", namespace, PVC_STORAGE_CLASS, "10Gi")
 
             mount(spawner, hub_home_name + "-pv", hub_home_name, "/home/jovyan", "pvc")
 

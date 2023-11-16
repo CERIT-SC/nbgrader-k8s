@@ -13,6 +13,7 @@ data:
     c.Exchange.root = "/mnt/exchange"
     c.Authenticator.plugin_class = JupyterHubAuthPlugin
 
+    # Use the custom k8s exchange
     c.ExchangeFactory.collect = 'nbgrader_k8s_exchange.plugin.ExchangeCollect'
     c.ExchangeFactory.exchange = 'nbgrader_k8s_exchange.plugin.Exchange'
     c.ExchangeFactory.fetch_assignment = 'nbgrader_k8s_exchange.plugin.ExchangeFetchAssignment'
