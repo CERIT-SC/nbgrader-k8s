@@ -96,7 +96,7 @@ async def bootstrap_pre_spawn(spawner):
         {
             "name": "nbgrader-exchange",
             "persistentVolumeClaim": {
-                "claimName": f"nbgrader-exchange-{courseName}"
+                "claimName": f"nbgrader-exchange"
             }
         }
     ])
